@@ -1,0 +1,1303 @@
+# ESP32-S3 Unified Telemetry + Video Firmware Development Plan
+
+**Date:** November 11, 2025
+**Goal:** Single ESP32-S3 board handling both MAVLink telemetry and low-latency video streaming
+
+---
+
+## Overview
+
+### Problem Statement
+Current VTX video setup has 170-250ms latency which is too slow for responsive AI control. Need lower latency video while maintaining reliable MAVLink telemetry.
+
+### Proposed Solution
+Custom firmware for ESP32-S3 that combines:
+- **Low-latency video streaming** (20-60ms target) using esp32-cam-fpv approach
+- **Reliable MAVLink telemetry** (TCP on port 5760) like DroneBridge
+
+### Expected Benefits
+- ✅ 2-4x lower video latency (60-100ms total vs 170-250ms)
+- ✅ Single board = 1-3g lighter than dual-board setup
+- ✅ Single board = $6 cheaper than C3+S3 combo
+- ✅ Simpler wiring and mounting
+- ✅ Digital video = easier PC integration (no capture card)
+- ✅ Both streams over single WiFi connection
+
+### Risks & Mitigation
+- ⚠️ **Risk:** Video processing might affect telemetry reliability
+  - **Mitigation:** Dual-core architecture with telemetry priority
+  - **Fallback:** Add dedicated C3 board if needed (+$6, +2g)
+
+---
+
+## Hardware Requirements
+
+### Drone Side
+
+**ESP32-S3 Board with PSRAM (Required):**
+- Option 1: ESP32-S3-DevKitC-1 (~$10-12) - larger, more GPIO
+- Option 2: XIAO ESP32-S3 (~$7-8) - compact, lighter
+- **CRITICAL:** Must have PSRAM (4MB+ recommended) for camera buffering
+
+**Camera Module:**
+- OV2640 (2MP) - $5-8 - recommended, well-supported
+- OV3660 (3MP) - $8-12 - higher resolution option
+- Connection: 8-bit parallel DVP interface
+
+**Antenna:**
+- 3dBi omnidirectional with u.FL/IPEX connector (~$3)
+- Examples: CORONIR IPEX antenna (lightweight copper tube)
+
+**Total Cost:** ~$15-20
+
+### Ground Side
+- PC with WiFi (or high-gain USB WiFi adapter)
+- Software: MAVProxy + video receiver (custom or VLC)
+
+### Flight Controller
+- Any FC with UART/TELEM port
+- MAVLink output configured
+- Baud rate: 460800 recommended (or 57600, 115200)
+
+---
+
+## System Architecture
+
+### Physical Connection
+```
+Flight Controller UART <---> ESP32-S3 <---> WiFi Router <---> Ground PC
+                               |                                  |
+                          OV2640 Camera                    MAVProxy + AI
+```
+
+### Dual-Core Task Distribution
+
+**Core 0 (PRO_CPU) - Camera & Video:**
+```
+┌─────────────────────────┐
+│ Camera DMA Capture      │
+│  └─> OV2640 @ 30 FPS    │
+│                         │
+│ MJPEG Encoding          │
+│  └─> Hardware accel     │
+│                         │
+│ UDP Video Streaming     │
+│  └─> Raw WiFi packets   │
+└─────────────────────────┘
+Target latency: 33ms camera + 20ms encoding + 10ms WiFi = ~63ms
+```
+
+**Core 1 (APP_CPU) - Telemetry & WiFi:**
+```
+┌─────────────────────────┐
+│ UART Handler            │
+│  └─> FC @ 460800 baud   │
+│                         │
+│ TCP Server              │
+│  └─> Port 5760          │
+│                         │
+│ Bidirectional Bridge    │
+│  └─> UART <-> TCP       │
+│                         │
+│ WiFi Management         │
+│  └─> Station mode       │
+└─────────────────────────┘
+Target latency: <15ms for telemetry
+```
+
+### Network Protocol Design
+
+**Telemetry (TCP):**
+- Port: 5760 (MAVLink standard)
+- Protocol: TCP (reliable, ordered delivery)
+- Priority: HIGH (critical for safety)
+- Bandwidth: ~100 Kbps typical
+
+**Video (UDP):**
+- Port: 5600 (configurable)
+- Protocol: UDP raw packets or RTP
+- Priority: MEDIUM (acceptable to drop frames)
+- Bandwidth: 1-2 Mbps (resolution dependent)
+
+**WiFi QoS:**
+- WMM enabled
+- Telemetry: AC_VO (Voice) - highest priority
+- Video: AC_VI (Video) - medium priority
+
+---
+
+## Development Approach
+
+### Two-Phase Strategy
+
+#### **Phase A: Quick Arduino Prototype (2-3 hours)**
+**Purpose:** Validate concept before investing in optimized version
+
+**Implementation:**
+- Arduino IDE with ESP32-S3 board support
+- Use `esp32-camera` library (simple API)
+- Basic TCP server for MAVLink
+- Simple HTTP/WebSocket video streaming
+
+**Expected Performance:**
+- Video latency: 100-150ms (acceptable for testing)
+- Telemetry: <20ms
+- Goal: Prove both can run simultaneously without packet loss
+
+**Success Criteria:**
+- MAVLink packet loss < 1% under video streaming
+- Video stream stable at 15+ FPS
+- No telemetry interruptions during parameter download
+
+**Code Structure:**
+```cpp
+// Arduino Quick Prototype
+#include "esp_camera.h"
+#include <WiFi.h>
+
+WiFiServer telemetry_server(5760);
+WiFiServer video_server(81);
+
+void setup() {
+    Serial1.begin(460800, SERIAL_8N1, RX_PIN, TX_PIN); // FC UART
+    camera_config_t config = {...};
+    esp_camera_init(&config);
+    WiFi.begin(ssid, password);
+    telemetry_server.begin();
+    video_server.begin();
+}
+
+void loop() {
+    handle_telemetry();  // UART <-> TCP bridge
+    handle_video();      // Camera -> HTTP stream
+}
+```
+
+#### **Phase B: Optimized Production Firmware (10-16 hours)**
+**Purpose:** Achieve minimum latency and maximum reliability
+
+**Base:** Fork `esp32-cam-fpv` by RomanLut/jeanlemotan
+- Repository: https://github.com/RomanLut/hx-esp32-cam-fpv
+- Proven 20-60ms video latency
+- WiFi packet injection for low latency
+- Professional code quality
+
+**Modifications Needed:**
+1. Add UART serial handler (Core 1)
+2. Add TCP server for MAVLink (Core 1)
+3. Implement bidirectional forwarding
+4. Add configuration system
+5. Integrate with existing video streaming
+
+**Expected Performance:**
+- Video latency: 20-60ms (glass-to-glass)
+- Telemetry: <15ms
+- Combined: Production-ready for AI control
+
+---
+
+## Development Timeline
+
+### Session 1: Core Functionality (3-4 hours)
+
+**Tasks:**
+1. Fork esp32-cam-fpv repository
+2. Study code architecture
+   - Camera task implementation
+   - WiFi streaming mechanism
+   - FreeRTOS task structure
+3. Add UART initialization
+   - Configure Serial1 on Core 1
+   - Set baud rate (configurable: 57600, 115200, 460800)
+4. Create TCP server task
+   - Listen on port 5760
+   - Handle client connections
+   - Reconnection logic
+5. Implement UART↔TCP bridge
+   - Buffered, bidirectional forwarding
+   - Handle large MAVLink messages (parameters, missions)
+6. Initial build and flash test
+
+**Deliverables:**
+- Compiling firmware
+- Basic telemetry connectivity
+- Video streaming maintained
+
+**Testing:**
+- Connect MAVProxy via TCP
+- Verify heartbeat reception
+- Check video stream still works
+
+---
+
+### Session 2: Integration & Testing (3-4 hours)
+
+**Tasks:**
+1. Test combined operation
+   - Video + telemetry simultaneously
+   - Measure latency for both
+2. Add configuration options
+   - Web interface or config file
+   - Baud rate selection
+   - TCP port configuration
+   - Video quality presets
+3. Implement status indicators
+   - LED: WiFi status, telemetry connection, video active
+   - Serial debug output
+4. Buffer optimization
+   - Tune UART buffers
+   - Tune TCP send/receive buffers
+   - Test with large parameter downloads
+
+**Deliverables:**
+- Stable combined operation
+- Configuration system
+- Status monitoring
+
+**Testing:**
+- MAVProxy parameter list (stress test)
+- Mission upload/download
+- Video quality under load
+- Packet loss measurement
+
+---
+
+### Session 3: Optimization (3-4 hours)
+
+**Tasks:**
+1. Performance profiling
+   - CPU usage per core
+   - WiFi bandwidth utilization
+   - Memory usage analysis
+2. Task priority tuning
+   - Ensure telemetry priority over video
+   - Prevent frame drops from blocking telemetry
+3. WiFi QoS implementation
+   - Mark telemetry packets high priority
+   - Use WMM for proper queuing
+4. Latency optimization
+   - Reduce buffering where safe
+   - Optimize context switching
+   - Fine-tune DMA settings
+5. Add telemetry statistics
+   - Packets sent/received
+   - Errors and retries
+   - Connection uptime
+
+**Deliverables:**
+- Optimized firmware
+- Performance metrics
+- Documented settings
+
+**Testing:**
+- Long-duration stability (30+ minutes)
+- Worst-case scenarios (parameter download during video)
+- WiFi interference testing
+- Range testing
+
+---
+
+### Session 4: Final Testing & Documentation (2-3 hours)
+
+**Tasks:**
+1. Comprehensive testing
+   - Stress test: continuous operation
+   - Edge cases: WiFi reconnection, FC reboot
+   - Interference: multiple WiFi networks
+2. Create user documentation
+   - Hardware setup guide
+   - Pin connections diagram
+   - Configuration instructions
+   - Troubleshooting guide
+3. Create developer documentation
+   - Code architecture
+   - Build instructions
+   - Customization guide
+4. Package release
+   - Pre-compiled binaries
+   - Web flasher integration (optional)
+   - GitHub release
+
+**Deliverables:**
+- Production-ready firmware
+- Complete documentation
+- Release package
+
+---
+
+## Technical Implementation Details
+
+### Pin Configuration (ESP32-S3-DevKitC-1 example)
+
+**Camera Interface (8-bit parallel DVP):**
+```cpp
+#define CAM_PIN_PWDN    -1  // Power down (not used)
+#define CAM_PIN_RESET   -1  // Reset (not used)
+#define CAM_PIN_XCLK    15  // External clock
+#define CAM_PIN_SIOD    4   // I2C SDA
+#define CAM_PIN_SIOC    5   // I2C SCL
+
+#define CAM_PIN_D7      16  // Data bit 7
+#define CAM_PIN_D6      17  // Data bit 6
+#define CAM_PIN_D5      18  // Data bit 5
+#define CAM_PIN_D4      12  // Data bit 4
+#define CAM_PIN_D3      10  // Data bit 3
+#define CAM_PIN_D2      8   // Data bit 2
+#define CAM_PIN_D1      9   // Data bit 1
+#define CAM_PIN_D0      11  // Data bit 0
+
+#define CAM_PIN_VSYNC   6   // Vertical sync
+#define CAM_PIN_HREF    7   // Horizontal reference
+#define CAM_PIN_PCLK    13  // Pixel clock
+```
+
+**UART for Flight Controller:**
+```cpp
+#define FC_UART_NUM     UART_NUM_1
+#define FC_RX_PIN       44  // ESP32 RX <- FC TX
+#define FC_TX_PIN       43  // ESP32 TX -> FC RX
+#define FC_BAUD         460800
+```
+
+**Status LED:**
+```cpp
+#define LED_PIN         2   // Built-in LED (or external)
+```
+
+### Code Structure
+
+**Main Application:**
+```cpp
+// main.cpp - FreeRTOS application
+
+#include "camera_handler.h"
+#include "telemetry_handler.h"
+#include "wifi_manager.h"
+
+void app_main() {
+    // Initialize hardware
+    init_gpio();
+    init_psram();
+    init_wifi();
+
+    // Core 0: Camera & Video Streaming
+    xTaskCreatePinnedToCore(
+        camera_task,        // Task function
+        "camera",           // Name
+        8192,               // Stack size (8KB)
+        NULL,               // Parameters
+        1,                  // Priority (medium)
+        &camera_handle,     // Task handle
+        0                   // Core 0
+    );
+
+    // Core 1: MAVLink Telemetry
+    xTaskCreatePinnedToCore(
+        telemetry_task,     // Task function
+        "telemetry",        // Name
+        4096,               // Stack size (4KB)
+        NULL,               // Parameters
+        2,                  // Priority (high)
+        &telemetry_handle,  // Task handle
+        1                   // Core 1
+    );
+
+    // Core 1: WiFi Management
+    xTaskCreatePinnedToCore(
+        wifi_task,          // Task function
+        "wifi",             // Name
+        4096,               // Stack size
+        NULL,               // Parameters
+        1,                  // Priority (medium)
+        &wifi_handle,       // Task handle
+        1                   // Core 1
+    );
+}
+```
+
+**Camera Task (Core 0):**
+```cpp
+// camera_handler.cpp
+
+void camera_task(void *pvParameters) {
+    camera_fb_t *fb = NULL;
+    uint8_t *jpeg_buf = NULL;
+    size_t jpeg_len = 0;
+
+    // Initialize camera
+    if (init_camera() != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (1) {
+        // Capture frame from camera
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Camera capture failed");
+            continue;
+        }
+
+        // Encode to MJPEG if not already
+        if (fb->format != PIXFORMAT_JPEG) {
+            bool jpeg_converted = frame2jpg(fb, 80, &jpeg_buf, &jpeg_len);
+            esp_camera_fb_return(fb);
+
+            if (!jpeg_converted) {
+                ESP_LOGE(TAG, "JPEG compression failed");
+                continue;
+            }
+        } else {
+            jpeg_buf = fb->buf;
+            jpeg_len = fb->len;
+        }
+
+        // Stream via WiFi (UDP or raw packets)
+        send_video_packet(jpeg_buf, jpeg_len);
+
+        // Cleanup
+        if (fb->format != PIXFORMAT_JPEG) {
+            free(jpeg_buf);
+        }
+        esp_camera_fb_return(fb);
+
+        // Maintain frame rate (30 FPS = 33ms)
+        vTaskDelay(pdMS_TO_TICKS(33));
+    }
+}
+
+esp_err_t init_camera() {
+    camera_config_t config = {
+        .pin_d0 = CAM_PIN_D0,
+        .pin_d1 = CAM_PIN_D1,
+        .pin_d2 = CAM_PIN_D2,
+        .pin_d3 = CAM_PIN_D3,
+        .pin_d4 = CAM_PIN_D4,
+        .pin_d5 = CAM_PIN_D5,
+        .pin_d6 = CAM_PIN_D6,
+        .pin_d7 = CAM_PIN_D7,
+        .pin_xclk = CAM_PIN_XCLK,
+        .pin_pclk = CAM_PIN_PCLK,
+        .pin_vsync = CAM_PIN_VSYNC,
+        .pin_href = CAM_PIN_HREF,
+        .pin_sscb_sda = CAM_PIN_SIOD,
+        .pin_sscb_scl = CAM_PIN_SIOC,
+        .pin_pwdn = CAM_PIN_PWDN,
+        .pin_reset = CAM_PIN_RESET,
+        .xclk_freq_hz = 20000000,
+        .pixel_format = PIXFORMAT_JPEG,
+        .frame_size = FRAMESIZE_VGA,  // 640x480
+        .jpeg_quality = 12,
+        .fb_count = 2,  // Double buffering
+        .grab_mode = CAMERA_GRAB_LATEST  // Always get newest frame
+    };
+
+    return esp_camera_init(&config);
+}
+```
+
+**Telemetry Task (Core 1):**
+```cpp
+// telemetry_handler.cpp
+
+#define UART_BUF_SIZE 2048
+#define TCP_BUF_SIZE 2048
+
+static int tcp_client_sock = -1;
+static uint8_t uart_rx_buf[UART_BUF_SIZE];
+static uint8_t tcp_rx_buf[TCP_BUF_SIZE];
+
+void telemetry_task(void *pvParameters) {
+    // Initialize UART
+    if (init_uart() != ESP_OK) {
+        ESP_LOGE(TAG, "UART init failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Create TCP server
+    int server_sock = create_tcp_server(5760);
+    if (server_sock < 0) {
+        ESP_LOGE(TAG, "TCP server create failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Telemetry task ready, listening on port 5760");
+
+    while (1) {
+        // Wait for client connection
+        if (tcp_client_sock < 0) {
+            tcp_client_sock = accept_client(server_sock);
+            if (tcp_client_sock >= 0) {
+                ESP_LOGI(TAG, "MAVLink client connected");
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        // Forward UART -> TCP (FC to PC)
+        int uart_len = uart_read_bytes(FC_UART_NUM, uart_rx_buf,
+                                       UART_BUF_SIZE, pdMS_TO_TICKS(10));
+        if (uart_len > 0) {
+            int sent = send(tcp_client_sock, uart_rx_buf, uart_len, 0);
+            if (sent < 0) {
+                ESP_LOGE(TAG, "TCP send failed, closing connection");
+                close(tcp_client_sock);
+                tcp_client_sock = -1;
+                continue;
+            }
+        }
+
+        // Forward TCP -> UART (PC to FC)
+        int tcp_len = recv(tcp_client_sock, tcp_rx_buf, TCP_BUF_SIZE,
+                          MSG_DONTWAIT);
+        if (tcp_len > 0) {
+            uart_write_bytes(FC_UART_NUM, tcp_rx_buf, tcp_len);
+        } else if (tcp_len == 0) {
+            // Connection closed
+            ESP_LOGI(TAG, "MAVLink client disconnected");
+            close(tcp_client_sock);
+            tcp_client_sock = -1;
+        }
+
+        // Small delay to prevent busy-waiting
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+esp_err_t init_uart() {
+    uart_config_t uart_config = {
+        .baud_rate = FC_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+
+    ESP_ERROR_CHECK(uart_param_config(FC_UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(FC_UART_NUM, FC_TX_PIN, FC_RX_PIN,
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(FC_UART_NUM, UART_BUF_SIZE * 2,
+                                        UART_BUF_SIZE * 2, 0, NULL, 0));
+
+    return ESP_OK;
+}
+```
+
+**WiFi Manager:**
+```cpp
+// wifi_manager.cpp
+
+void wifi_task(void *pvParameters) {
+    // Initialize WiFi in Station mode
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    while (1) {
+        // Monitor WiFi status
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi RSSI: %d dBm", ap_info.rssi);
+        }
+
+        // Reconnect if disconnected
+        if (!is_wifi_connected()) {
+            ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+            esp_wifi_connect();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds
+    }
+}
+```
+
+---
+
+## Configuration System
+
+### Option 1: Config File (menuconfig)
+```cpp
+// Kconfig
+menu "Drone Telemetry Configuration"
+    config FC_UART_BAUD
+        int "Flight Controller UART Baud Rate"
+        default 460800
+        help
+            Baud rate for communication with flight controller
+
+    config TELEMETRY_TCP_PORT
+        int "MAVLink TCP Port"
+        default 5760
+        help
+            TCP port for MAVLink telemetry
+
+    config VIDEO_UDP_PORT
+        int "Video UDP Port"
+        default 5600
+        help
+            UDP port for video streaming
+
+    config VIDEO_FRAME_SIZE
+        int "Video Frame Size"
+        default 10
+        help
+            0=96x96, 5=320x240, 10=640x480, 12=800x600
+endmenu
+```
+
+### Option 2: Web Configuration Interface
+```cpp
+// Serve configuration page on http://192.168.x.x/config
+// Allow runtime changes to:
+// - WiFi credentials
+// - Baud rate
+// - Video quality
+// - TCP/UDP ports
+```
+
+### Option 3: JSON Configuration File
+```json
+{
+    "wifi": {
+        "ssid": "YourNetwork",
+        "password": "YourPassword"
+    },
+    "telemetry": {
+        "uart_baud": 460800,
+        "tcp_port": 5760
+    },
+    "video": {
+        "frame_size": "VGA",
+        "fps": 30,
+        "quality": 12,
+        "udp_port": 5600
+    }
+}
+```
+
+---
+
+## Testing Procedures
+
+### Unit Testing
+
+**Test 1: UART Communication**
+```bash
+# Connect ESP32-S3 to PC via USB-Serial adapter
+# ESP32 TX -> Adapter RX
+# ESP32 RX -> Adapter TX
+
+# Terminal 1: Send test data
+echo "Hello from PC" > /dev/ttyUSB0
+
+# Terminal 2: Monitor ESP32 output
+screen /dev/ttyUSB1 460800
+
+# Verify bidirectional communication
+```
+
+**Test 2: TCP Server**
+```bash
+# Connect to ESP32 TCP server
+nc 192.168.x.x 5760
+
+# Send test data
+echo "TEST" | nc 192.168.x.x 5760
+
+# Verify server accepts connection and echoes data
+```
+
+**Test 3: Camera Capture**
+```bash
+# Stream video to VLC
+vlc udp://@:5600
+
+# Or capture with ffmpeg
+ffmpeg -i udp://192.168.x.x:5600 -c copy output.mjpeg
+
+# Verify frame rate and quality
+```
+
+### Integration Testing
+
+**Test 4: MAVLink Connection**
+```bash
+# Connect MAVProxy
+mavproxy.py --master=tcp:192.168.x.x:5760
+
+# Verify heartbeat
+MAV> link
+
+# Test parameter list (stress test)
+MAV> param fetch
+
+# Test mission download
+MAV> wp list
+```
+
+**Test 5: Combined Operation**
+```bash
+# Terminal 1: Start video stream
+vlc udp://@:5600
+
+# Terminal 2: Start MAVProxy
+mavproxy.py --master=tcp:192.168.x.x:5760
+
+# Terminal 3: Monitor ESP32 logs
+screen /dev/ttyUSB0 115200
+
+# Stress test: param fetch while streaming video
+# Monitor packet loss and latency
+```
+
+**Test 6: Long Duration Stability**
+```bash
+# Run for 30+ minutes
+# Monitor:
+# - Packet loss (MAVProxy link command)
+# - Video frame drops
+# - Memory leaks (ESP32 free heap)
+# - WiFi disconnections
+# - CPU temperature (if sensor available)
+```
+
+### Performance Benchmarks
+
+**Latency Measurement:**
+```python
+# measure_latency.py
+import time
+from pymavlink import mavutil
+
+master = mavutil.mavlink_connection('tcp:192.168.x.x:5760')
+
+while True:
+    start = time.time()
+
+    # Send command
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+        0, 30, 0, 0, 0, 0, 0, 0  # Request ATTITUDE
+    )
+
+    # Wait for response
+    msg = master.recv_match(type='ATTITUDE', blocking=True, timeout=1)
+
+    if msg:
+        latency = (time.time() - start) * 1000
+        print(f"Latency: {latency:.2f} ms")
+
+    time.sleep(0.1)
+```
+
+**Packet Loss Measurement:**
+```python
+# measure_packet_loss.py
+from pymavlink import mavutil
+import time
+
+master = mavutil.mavlink_connection('tcp:192.168.x.x:5760')
+
+seq_numbers = {}
+lost_packets = 0
+total_packets = 0
+
+while True:
+    msg = master.recv_match(blocking=True, timeout=1)
+    if msg:
+        msg_type = msg.get_type()
+        seq = msg.get_seq()
+
+        if msg_type not in seq_numbers:
+            seq_numbers[msg_type] = seq
+        else:
+            expected = (seq_numbers[msg_type] + 1) % 256
+            if seq != expected:
+                lost = (seq - expected) % 256
+                lost_packets += lost
+                print(f"Lost {lost} {msg_type} packets")
+            seq_numbers[msg_type] = seq
+
+        total_packets += 1
+
+        if total_packets % 1000 == 0:
+            loss_rate = (lost_packets / total_packets) * 100
+            print(f"Packet loss: {loss_rate:.2f}% ({lost_packets}/{total_packets})")
+```
+
+**Video Latency Measurement:**
+```python
+# Display timestamp on camera, measure delay to PC screen
+# Use high-speed camera or smartphone slow-mo to measure
+# Target: <100ms end-to-end
+```
+
+---
+
+## Known Challenges & Solutions
+
+### Challenge 1: WiFi Bandwidth Contention
+
+**Problem:**
+- Video: 1-2 Mbps continuous
+- Telemetry: 100 Kbps bursty (spikes during parameter download)
+- Both competing for WiFi bandwidth
+
+**Solution:**
+```cpp
+// Implement WiFi QoS (WMM)
+esp_wifi_set_ps(WIFI_PS_NONE);  // Disable power save for low latency
+
+// Mark telemetry packets as high priority
+int tos = IPTOS_PREC_INTERNETCONTROL;  // High priority
+setsockopt(tcp_sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+
+// Mark video packets as medium priority
+int tos_video = IPTOS_PREC_FLASH;  // Medium priority
+setsockopt(udp_sock, IPPROTO_IP, IP_TOS, &tos_video, sizeof(tos_video));
+```
+
+### Challenge 2: Core 1 WiFi Access
+
+**Problem:**
+- WiFi stack runs primarily on Core 0
+- Core 1 (telemetry) needs WiFi access
+- Can cause synchronization issues
+
+**Solution:**
+```cpp
+// Use thread-safe WiFi APIs
+// All lwIP socket operations are thread-safe by default
+
+// For sending from Core 1:
+int send_telemetry(const uint8_t *data, size_t len) {
+    // send() is thread-safe, no mutex needed
+    return send(tcp_client_sock, data, len, 0);
+}
+
+// For critical sections (if needed):
+static SemaphoreHandle_t wifi_mutex;
+
+void init_wifi_mutex() {
+    wifi_mutex = xSemaphoreCreateMutex();
+}
+
+void safe_wifi_operation() {
+    if (xSemaphoreTake(wifi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Critical WiFi operation
+        xSemaphoreGive(wifi_mutex);
+    }
+}
+```
+
+### Challenge 3: Buffer Overflow on Large MAVLink Messages
+
+**Problem:**
+- Parameter list can be 1000+ messages
+- Mission uploads can be large
+- Fixed buffers might overflow
+
+**Solution:**
+```cpp
+// Dynamic buffer allocation
+#define MAX_MAVLINK_MSG_SIZE 280  // MAVLink v2 max size
+
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+} dynamic_buffer_t;
+
+dynamic_buffer_t* create_buffer(size_t initial_capacity) {
+    dynamic_buffer_t *buf = malloc(sizeof(dynamic_buffer_t));
+    buf->data = malloc(initial_capacity);
+    buf->size = 0;
+    buf->capacity = initial_capacity;
+    return buf;
+}
+
+void buffer_append(dynamic_buffer_t *buf, const uint8_t *data, size_t len) {
+    if (buf->size + len > buf->capacity) {
+        // Grow buffer
+        buf->capacity = (buf->size + len) * 2;
+        buf->data = realloc(buf->data, buf->capacity);
+    }
+    memcpy(buf->data + buf->size, data, len);
+    buf->size += len;
+}
+
+// Use ring buffer for streaming
+#include "freertos/ringbuf.h"
+
+RingbufHandle_t uart_ringbuf;
+uart_ringbuf = xRingbufferCreate(4096, RINGBUF_TYPE_BYTEBUF);
+
+// Producer (UART ISR)
+xRingbufferSend(uart_ringbuf, data, len, 0);
+
+// Consumer (TCP task)
+size_t item_size;
+uint8_t *item = xRingbufferReceive(uart_ringbuf, &item_size, pdMS_TO_TICKS(10));
+if (item) {
+    send(tcp_sock, item, item_size, 0);
+    vRingbufferReturnItem(uart_ringbuf, item);
+}
+```
+
+### Challenge 4: Camera DMA Blocking Telemetry
+
+**Problem:**
+- Camera DMA transfers can block CPU momentarily
+- Might cause telemetry packet delays
+
+**Solution:**
+```cpp
+// Configure camera for lowest latency
+camera_config_t config = {
+    // ... other settings ...
+    .fb_count = 2,  // Double buffering
+    .grab_mode = CAMERA_GRAB_LATEST,  // Drop frames if behind
+    .fb_location = CAMERA_FB_IN_PSRAM,  // Use PSRAM, not main RAM
+};
+
+// Set telemetry task priority higher than camera
+xTaskCreatePinnedToCore(camera_task, "cam", 8192, NULL, 1, NULL, 0);
+xTaskCreatePinnedToCore(telemetry_task, "tel", 4096, NULL, 2, NULL, 1);
+//                                                            ^
+//                                                    Higher priority (2 vs 1)
+
+// Configure UART with high watermark for buffering
+uart_set_rx_full_threshold(FC_UART_NUM, 120);  // Trigger at 120 bytes
+```
+
+### Challenge 5: PSRAM Speed Limitations
+
+**Problem:**
+- PSRAM is slower than internal SRAM
+- Can cause latency if not managed properly
+
+**Solution:**
+```cpp
+// Use PSRAM only for large buffers (camera frames)
+// Keep critical data in SRAM
+
+// Allocate camera buffer in PSRAM
+uint8_t *camera_fb = heap_caps_malloc(CAMERA_FB_SIZE,
+                                      MALLOC_CAP_SPIRAM);
+
+// Allocate telemetry buffers in SRAM (fast)
+uint8_t *uart_buf = heap_caps_malloc(UART_BUF_SIZE,
+                                      MALLOC_CAP_INTERNAL);
+
+// Check allocation location
+if (heap_caps_get_allocated_size(MALLOC_CAP_SPIRAM)) {
+    ESP_LOGI(TAG, "Using PSRAM for camera buffers");
+}
+```
+
+---
+
+## Alternative Approaches
+
+### Alternative 1: Use Standard Libraries (Quick Prototype)
+
+**Pros:**
+- ✅ Faster development (2-3 hours)
+- ✅ Well-documented APIs
+- ✅ Good for proof-of-concept
+
+**Cons:**
+- ⚠️ Higher latency (100-150ms vs 20-60ms)
+- ⚠️ Less control over optimization
+- ⚠️ Larger code size
+
+**Libraries:**
+```cpp
+#include "esp_camera.h"       // Camera driver
+#include "esp_http_server.h"  // HTTP server for video
+#include <WiFi.h>             // WiFi
+#include <WiFiClient.h>       // TCP client
+```
+
+### Alternative 2: Fork DroneBridge + Add Camera
+
+**Pros:**
+- ✅ DroneBridge telemetry already proven
+- ✅ Professional code quality
+- ✅ Good configuration system
+
+**Cons:**
+- ⚠️ Video latency not optimized
+- ⚠️ More code to understand
+- ⚠️ Tighter integration needed
+
+**Approach:**
+- Clone DroneBridge ESP32
+- Add camera initialization
+- Add HTTP/WebSocket video stream
+- Integrate into main loop
+
+### Alternative 3: Two Separate Firmwares (Dual Board)
+
+**Pros:**
+- ✅ Zero development time
+- ✅ Both proven separately
+- ✅ Maximum reliability
+- ✅ Easy to debug
+
+**Cons:**
+- ⚠️ Extra weight (1-3g)
+- ⚠️ Extra cost ($6)
+- ⚠️ More wiring
+
+**Setup:**
+- Board 1: XIAO ESP32-C3 running DroneBridge (telemetry)
+- Board 2: ESP32-S3 running esp32-cam-fpv (video)
+- Both connect to same WiFi network
+
+---
+
+## Bill of Materials
+
+### Option A: Single Board (Unified Firmware)
+
+| Item | Quantity | Unit Price | Total | Notes |
+|------|----------|------------|-------|-------|
+| ESP32-S3-DevKitC-1 (8MB PSRAM) | 1 | $12 | $12 | Or XIAO ESP32-S3 ($7) |
+| OV2640 Camera Module | 1 | $6 | $6 | 2MP, DVP interface |
+| 3dBi u.FL Antenna (CORONIR) | 1 | $3 | $3 | Lightweight copper tube |
+| Dupont wires | ~10 | $0.10 | $1 | For connections |
+| **Total** | | | **$22** | |
+
+**Weight:** 4-6g (board + camera + wiring)
+
+### Option B: Dual Board (Separate Firmwares)
+
+| Item | Quantity | Unit Price | Total | Notes |
+|------|----------|------------|-------|-------|
+| XIAO ESP32-C3 | 1 | $6 | $6 | Telemetry |
+| ESP32-S3-DevKitC-1 (8MB PSRAM) | 1 | $12 | $12 | Video |
+| OV2640 Camera Module | 1 | $6 | $6 | 2MP, DVP interface |
+| 3dBi u.FL Antenna (CORONIR) | 2 | $3 | $6 | One per board |
+| Dupont wires | ~15 | $0.10 | $2 | For connections |
+| **Total** | | | **$32** | |
+
+**Weight:** 6-9g (two boards + camera + wiring)
+
+**Comparison:**
+- Single board: Cheaper ($10 saved), lighter (2-3g saved)
+- Dual board: More reliable, easier debugging, proven firmware
+
+---
+
+## Decision Tree
+
+```
+┌─────────────────────────────────────────────┐
+│ Is video latency critical for your AI?      │
+│ (Need <100ms for responsive control)        │
+└──────────────┬──────────────────────────────┘
+               │
+        ┌──────┴───────┐
+        │              │
+       YES             NO
+        │              │
+        ▼              ▼
+┌───────────────┐  Keep current
+│ Try ESP32-S3  │  VTX setup
+│ video setup   │  (170-250ms OK)
+└───────┬───────┘
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│ Start with dual-board approach:             │
+│ - C3 (telemetry) + S3 (video)               │
+│ - Proven firmware on both                   │
+│ - Test if video helps AI performance        │
+└──────────────┬──────────────────────────────┘
+               │
+        ┌──────┴───────┐
+        │              │
+   Video helps    Video doesn't help
+        │              │
+        ▼              ▼
+┌────────────────┐  Stick with telemetry
+│ Is weight      │  only (no video needed)
+│ critical?      │
+└────┬───────────┘
+     │
+  ┌──┴───┐
+ YES    NO
+  │      │
+  ▼      ▼
+Develop   Keep
+single    dual
+board     board
+firmware  setup
+(10-16h)  (working)
+```
+
+---
+
+## Success Criteria
+
+### Minimum Viable Product (MVP)
+
+**Functional Requirements:**
+- ✅ MAVLink telemetry working via TCP
+- ✅ Video streaming at 15+ FPS
+- ✅ Both operating simultaneously
+- ✅ Packet loss < 1%
+- ✅ Stable for 10+ minutes
+
+**Performance Requirements:**
+- ✅ Telemetry latency < 50ms (acceptable)
+- ✅ Video latency < 150ms (acceptable)
+- ✅ Combined operation doesn't degrade either
+
+### Production Ready
+
+**Functional Requirements:**
+- ✅ All MVP requirements
+- ✅ Configuration system (web or file)
+- ✅ Status indicators (LED, serial output)
+- ✅ Automatic reconnection handling
+- ✅ Error recovery
+
+**Performance Requirements:**
+- ✅ Telemetry latency < 20ms (target)
+- ✅ Video latency < 100ms (target)
+- ✅ Packet loss < 0.5%
+- ✅ Stable for 30+ minutes
+- ✅ Works at 50m+ range
+
+### Optimal
+
+**Functional Requirements:**
+- ✅ All Production requirements
+- ✅ Multiple video quality presets
+- ✅ Adjustable frame rate
+- ✅ Remote configuration (no reflash needed)
+- ✅ OTA updates
+
+**Performance Requirements:**
+- ✅ Telemetry latency < 15ms (optimal)
+- ✅ Video latency < 60ms (optimal)
+- ✅ Packet loss < 0.2%
+- ✅ Stable for hours
+- ✅ Works at 200m+ range
+
+---
+
+## Resources & References
+
+### ESP32-S3 Documentation
+- **Datasheet:** https://www.espressif.com/sites/default/files/documentation/esp32-s3_datasheet_en.pdf
+- **Technical Reference:** https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf
+- **Camera Driver:** https://github.com/espressif/esp32-camera
+
+### Low-Latency Video Projects
+- **esp32-cam-fpv (RomanLut):** https://github.com/RomanLut/hx-esp32-cam-fpv
+- **esp32-cam-fpv (jeanlemotan):** https://github.com/jeanlemotan/esp32-cam-fpv
+- **Discussion:** https://www.rcgroups.com/forums/showthread.php?3426317
+
+### MAVLink Resources
+- **MAVLink Guide:** https://mavlink.io/en/
+- **pymavlink:** https://github.com/ArduPilot/pymavlink
+- **MAVProxy:** https://ardupilot.org/mavproxy/
+
+### DroneBridge
+- **GitHub:** https://github.com/DroneBridge/ESP32
+- **Documentation:** https://dronebridge.gitbook.io/docs/
+- **Web Flasher:** https://drone-bridge.com/flasher/
+
+### Development Tools
+- **ESP-IDF:** https://docs.espressif.com/projects/esp-idf/en/latest/
+- **PlatformIO:** https://platformio.org/
+- **Arduino ESP32:** https://github.com/espressif/arduino-esp32
+
+---
+
+## Contact & Support
+
+### If You Proceed with Development
+
+**Before starting:**
+- Order hardware (ESP32-S3 + OV2640 + antenna)
+- Set up development environment (ESP-IDF or PlatformIO)
+- Test hardware individually (camera, UART, WiFi)
+
+**During development:**
+- Regular testing between sessions
+- Report any hardware issues immediately
+- Save logs for debugging
+
+**Questions to clarify:**
+- Preferred development framework (ESP-IDF vs Arduino)?
+- Video quality preference (resolution vs frame rate)?
+- Range requirements (100m? 500m? 1km+)?
+- TCP only or UDP support needed?
+
+---
+
+## Appendix: Quick Start Checklist
+
+### Hardware Setup
+- [ ] Order ESP32-S3 board with 8MB+ PSRAM
+- [ ] Order OV2640 camera module
+- [ ] Order 3dBi u.FL antenna
+- [ ] Get dupont wires for connections
+- [ ] Prepare flight controller with MAVLink UART
+
+### Software Setup
+- [ ] Install ESP-IDF or PlatformIO
+- [ ] Install USB drivers (CP210x or CH340)
+- [ ] Test basic ESP32-S3 examples (blink, WiFi scan)
+- [ ] Test camera examples (capture, stream)
+
+### Phase A: Quick Prototype
+- [ ] Build Arduino-based prototype
+- [ ] Test telemetry only
+- [ ] Test video only
+- [ ] Test both simultaneously
+- [ ] Measure packet loss
+- [ ] Decide: good enough or need optimization?
+
+### Phase B: Optimized Firmware (if needed)
+- [ ] Fork esp32-cam-fpv repository
+- [ ] Add UART + TCP telemetry code
+- [ ] Test combined operation
+- [ ] Optimize performance
+- [ ] Long-term stability testing
+- [ ] Document and release
+
+### Deployment
+- [ ] Flash production firmware
+- [ ] Mount on drone
+- [ ] Configure WiFi and settings
+- [ ] Ground test (bench test with FC)
+- [ ] Short flight test (hover, 1-2 min)
+- [ ] Full flight test (normal flight profile)
+- [ ] AI integration test
+
+---
+
+**End of ESP32-S3 Unified Firmware Development Plan**
+
+*This document should be used as a reference if deciding to pursue single-board ESP32-S3 solution. For most use cases, the dual-board approach (C3 for telemetry + S3 for video) is recommended as it uses proven firmware and provides maximum reliability.*
